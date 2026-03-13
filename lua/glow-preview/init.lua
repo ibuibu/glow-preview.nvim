@@ -4,17 +4,14 @@ local state = {
   preview_buf = nil,
   preview_win = nil,
   md_buf = nil,
-  chan = nil,
   augroup = nil,
   timer = nil,
+  tmpfile = nil,
 }
 
 local DEBOUNCE_MS = 300
 
 function M.render()
-  if not state.chan then
-    return
-  end
   if not state.preview_win or not vim.api.nvim_win_is_valid(state.preview_win) then
     return
   end
@@ -25,8 +22,10 @@ function M.render()
   local lines = vim.api.nvim_buf_get_lines(state.md_buf, 0, -1, false)
   local content = table.concat(lines, "\n")
 
-  local tmpfile = vim.fn.tempname() .. ".md"
-  local f = io.open(tmpfile, "w")
+  if not state.tmpfile then
+    state.tmpfile = vim.fn.tempname() .. ".md"
+  end
+  local f = io.open(state.tmpfile, "w")
   if not f then
     return
   end
@@ -34,25 +33,19 @@ function M.render()
   f:close()
 
   local width = vim.api.nvim_win_get_width(state.preview_win)
+  local cmd = string.format("glow -w %d %s", width, vim.fn.shellescape(state.tmpfile))
 
-  vim.fn.jobstart({ "glow", "-w", tostring(width), tmpfile }, {
-    stdout_buffered = true,
-    on_stdout = function(_, data)
-      if not state.chan then
-        return
-      end
-      local output = table.concat(data, "\n")
-      vim.schedule(function()
-        if state.chan then
-          vim.api.nvim_chan_send(state.chan, "\x1b[2J\x1b[H")
-          vim.api.nvim_chan_send(state.chan, output)
-        end
-      end)
-    end,
-    on_exit = function()
-      os.remove(tmpfile)
-    end,
-  })
+  -- Create a fresh terminal buffer (old one auto-wiped via bufhidden)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.api.nvim_win_set_buf(state.preview_win, buf)
+  state.preview_buf = buf
+
+  -- Run glow in a real PTY so ANSI colors work
+  local cur_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_set_current_win(state.preview_win)
+  vim.fn.termopen(cmd)
+  vim.api.nvim_set_current_win(cur_win)
 end
 
 local function schedule_render()
@@ -86,19 +79,13 @@ function M.open()
 
   -- Open right split
   vim.cmd("botright vsplit")
-  state.preview_buf = vim.api.nvim_create_buf(false, true)
   state.preview_win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(state.preview_win, state.preview_buf)
 
-  -- Preview buffer/window options
-  vim.bo[state.preview_buf].bufhidden = "wipe"
+  -- Window options
   vim.wo[state.preview_win].number = false
   vim.wo[state.preview_win].relativenumber = false
   vim.wo[state.preview_win].signcolumn = "no"
   vim.wo[state.preview_win].wrap = true
-
-  -- Virtual terminal for ANSI color rendering
-  state.chan = vim.api.nvim_open_term(state.preview_buf, {})
 
   -- Autocommands
   state.augroup = vim.api.nvim_create_augroup("GlowPreview", { clear = true })
@@ -145,9 +132,12 @@ function M.close()
   if state.preview_win and vim.api.nvim_win_is_valid(state.preview_win) then
     vim.api.nvim_win_close(state.preview_win, true)
   end
+  if state.tmpfile then
+    os.remove(state.tmpfile)
+    state.tmpfile = nil
+  end
   state.preview_buf = nil
   state.preview_win = nil
-  state.chan = nil
   state.md_buf = nil
 end
 
